@@ -1,153 +1,100 @@
 import os
+import json
 import asyncio
+from aiohttp import web
+from pyrogram import Client, filters
+from pyrogram.errors import FloodWait
 import gspread
-from flask import Flask
-from threading import Thread
-from telethon import TelegramClient
-from telethon.errors.rpcerrorlist import FloodWaitError
 from oauth2client.service_account import ServiceAccountCredentials
 
-# =====================
-# CONFIG
-# =====================
-# 👉 For LOCAL testing, put your real values directly:
-API_ID = 31253274   # ← your real api id
-API_HASH = "a030168a85a5cdb750c0557b684491e3"
+# =========================
+# 🔐 ENV VARIABLES
+# =========================
 
-# 👉 For Render later, change to:
-# API_ID = int(os.getenv("API_ID"))
-# API_HASH = os.getenv("API_HASH")
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-BATCH_SIZE = 50
-WAIT_TIME = 8
-CHANNEL_DELAY = 15
+# Google credentials from environment variable
+google_credentials_json = os.getenv("GOOGLE_CREDENTIALS")
+google_credentials = json.loads(google_credentials_json)
 
-# =====================
-# GOOGLE SHEETS SETUP
-# =====================
+# =========================
+# 📊 GOOGLE SHEETS SETUP
+# =========================
+
 scope = [
     "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/drive"
 ]
 
-creds = ServiceAccountCredentials.from_json_keyfile_name(
-    "google_credentials.json", scope
+creds = ServiceAccountCredentials.from_json_keyfile_dict(
+    google_credentials, scope
 )
 
-sheet_client = gspread.authorize(creds)
-sheet = sheet_client.open("TelegramSync").sheet1  # Must match your sheet name
+client_sheet = gspread.authorize(creds)
 
-# =====================
-# KEEP ALIVE SERVER (for Render)
-# =====================
-app = Flask("")
+# Replace with your sheet name
+SHEET_NAME = "TelegramSyncData"
+sheet = client_sheet.open(SHEET_NAME).sheet1
 
-@app.route("/")
-def home():
-    return "Bot Running!"
+# =========================
+# 🤖 PYROGRAM CLIENT
+# =========================
 
-def run():
-    app.run(host="0.0.0.0", port=10000)
+app = Client(
+    "telegram_sync_bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN
+)
 
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
+# =========================
+# 🚀 MESSAGE HANDLER
+# =========================
 
-# =====================
-# TELEGRAM CLIENT
-# =====================
-client = TelegramClient("session", API_ID, API_HASH)
+@app.on_message(filters.channel)
+async def forward_handler(client, message):
+    try:
+        # Example: Log message ID to Google Sheet
+        sheet.append_row([str(message.chat.id), message.id])
+        print(f"Saved message {message.id}")
 
-# =====================
-# STATUS UPDATE
-# =====================
-def update_status(row, status):
-    sheet.update_cell(row, 4, status)
-    print(f"Row {row} → {status}")
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
 
-# =====================
-# PROCESS CHANNEL
-# =====================
-async def process_channel(row, source, target):
-    progress_file = f"last_id_{source}.txt"
+    except Exception as e:
+        print("Error:", e)
 
-    # Load last transferred message ID
-    if not os.path.exists(progress_file):
-        last_id = 0
-        update_status(row, "WAITING")
-    else:
-        with open(progress_file, "r") as f:
-            last_id = int(f.read())
+# =========================
+# 🌐 KEEP RENDER ALIVE
+# =========================
 
-    update_status(row, "TRANSFERRING")
+async def handle(request):
+    return web.Response(text="Bot is running!")
 
-    while True:
-        messages = await client.get_messages(
-            source,
-            min_id=last_id,
-            limit=BATCH_SIZE
-        )
+async def start_webserver():
+    app_web = web.Application()
+    app_web.router.add_get("/", handle)
 
-        if not messages:
-            update_status(row, "DONE")
-            break
+    port = int(os.environ.get("PORT", 10000))
+    runner = web.AppRunner(app_web)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
 
-        for msg in reversed(messages):
-            try:
-                # Send media
-                if msg.media:
-                    await client.send_file(
-                        target,
-                        msg.media,
-                        caption=msg.text if msg.text else None
-                    )
+# =========================
+# ▶️ MAIN START
+# =========================
 
-                # Send text
-                elif msg.text:
-                    await client.send_message(target, msg.text)
-
-                # Skip empty/service messages
-                else:
-                    continue
-
-                last_id = msg.id
-
-                with open(progress_file, "w") as f:
-                    f.write(str(last_id))
-
-            except FloodWaitError as e:
-                print(f"Flood wait: sleeping {e.seconds} seconds")
-                await asyncio.sleep(e.seconds)
-
-        print(f"{source} → Batch Completed")
-        await asyncio.sleep(WAIT_TIME)
-
-    await asyncio.sleep(CHANNEL_DELAY)
-
-# =====================
-# MAIN LOOP
-# =====================
 async def main():
-    await client.start()
+    await app.start()
+    print("Bot Started Successfully!")
+
+    await start_webserver()
 
     while True:
-        records = sheet.get_all_records()
+        await asyncio.sleep(3600)
 
-        for i, row_data in enumerate(records):
-            row_number = i + 2  # Skip header row
-            source = row_data["source_channel"]
-            target = row_data["target_channel"]
-
-            if source and target:
-                await process_channel(row_number, source, target)
-
-        print("Restarting full cycle...")
-        await asyncio.sleep(30)
-
-# =====================
-# START
-# =====================
-keep_alive()
-
-with client:
-    client.loop.run_until_complete(main())
+if __name__ == "__main__":
+    asyncio.run(main())
